@@ -42,10 +42,17 @@ client = AsyncOpenAI(
 )
 
 # --- Хранилища состояния ---
-user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+user_locks: dict[int, asyncio.Lock] = {}
 user_histories: dict[int, list[dict]] = defaultdict(list)
 user_stats: dict[int, int] = defaultdict(int)
 processing_times: list[float] = []
+
+
+def get_lock(uid: int) -> asyncio.Lock:
+    """Безопасное получение лока для конкретного пользователя."""
+    if uid not in user_locks:
+        user_locks[uid] = asyncio.Lock()
+    return user_locks[uid]
 
 
 # ================= РАБОТА С ДАННЫМИ =================
@@ -175,16 +182,24 @@ def extract_files(text: str) -> tuple[str, list[tuple[str, str]]]:
 
 # ================= СТРИМИНГ NVIDIA =================
 async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid: int):
-    thinking_msg: Message | None = None
+    status_msg: Message | None = None
     start_thinking_time: float | None = None
     last_edit_time: float = 0.0
 
     content_text = ""
     is_thinking_phase = True
+    first_token_received = False
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": prompt}]
 
+    # 1. Сразу показываем сообщение об очереди/ожидании подключения
+    status_msg = await message.answer(
+        "⏳ *Твой запрос находится в очереди!*\n"
+        "✨ *Подключение к API...*"
+    )
+
     try:
+        # 2. Сразу подключаемся к API (стрим начинается)
         stream = await client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
@@ -205,41 +220,62 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
                 continue
             delta = chunk.choices[0].delta
 
-            # Фаза reasoning
+            # --- Фаза reasoning ---
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning:
-                if start_thinking_time is None:
+                # Пришёл первый токен размышления!
+                if not first_token_received:
+                    first_token_received = True
                     start_thinking_time = time.monotonic()
-                    thinking_msg = await message.answer("💭 *Thinking: 0s*")
                     last_edit_time = time.monotonic()
+                    
+                    # Заменяем "В очереди" на "Thinking"
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text("💭 *Thinking: 0s*")
+                        except Exception:
+                            status_msg = await message.answer("💭 *Thinking: 0s*")
 
                 now = time.monotonic()
-                if now - last_edit_time >= 3.0 and thinking_msg:
+                # Обновляем таймер каждые 3 секунды
+                if now - last_edit_time >= 3.0 and status_msg:
                     elapsed = int(now - start_thinking_time)
                     try:
-                        await thinking_msg.edit_text(f"💭 *Thinking: {elapsed}s*")
+                        await status_msg.edit_text(f"💭 *Thinking: {elapsed}s*")
                     except Exception:
                         pass
                     last_edit_time = now
 
-            # Фаза контента
+            # --- Фаза контента ---
             if delta.content:
+                # Если контента нет, но пришёл текст (модель пропустила reasoning)
+                if not first_token_received:
+                    first_token_received = True
+                    start_thinking_time = time.monotonic()
+                    if status_msg:
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
+                        status_msg = None
+
                 content_text += delta.content
+                
                 if is_thinking_phase and start_thinking_time is not None:
                     is_thinking_phase = False
                     final_elapsed = int(time.monotonic() - start_thinking_time)
-                    if thinking_msg:
+                    if status_msg:
                         try:
-                            await thinking_msg.edit_text(f"💭 *Thinking: {final_elapsed}s*")
+                            await status_msg.edit_text(f"💭 *Thinking: {final_elapsed}s*")
                         except Exception:
                             pass
 
     except Exception as e:
         logger.exception("Streaming error")
         err = f"*❌ Ошибка генерации:* `{e}`"
-        if thinking_msg:
+        if status_msg:
             try:
-                await thinking_msg.edit_text(err)
+                await status_msg.edit_text(err)
             except Exception:
                 await message.answer(err)
         else:
@@ -270,18 +306,18 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
 
     # Отправляем / редактируем основное сообщение
     if len(final_text) <= 4096:
-        if thinking_msg:
+        if status_msg:
             try:
-                await thinking_msg.edit_text(final_text)
+                await status_msg.edit_text(final_text)
             except Exception:
                 await message.answer(final_text)
         else:
             await message.answer(final_text)
     else:
         first = final_text[:4096]
-        if thinking_msg:
+        if status_msg:
             try:
-                await thinking_msg.edit_text(first)
+                await status_msg.edit_text(first)
             except Exception:
                 await message.answer(first)
         else:
@@ -301,9 +337,9 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
 @dp.message(F.text)
 async def handle_message(message: Message):
     uid = message.from_user.id
-    lock = user_locks[uid]
+    lock = get_lock(uid)
 
-    # Блокировка: если запрос уже обрабатывается — показываем очередь
+    # Если лок занят — значит стрим уже идёт, пишем про очередь
     if lock.locked():
         avg = sum(processing_times) / len(processing_times) if processing_times else 15
         await message.answer(
@@ -312,6 +348,7 @@ async def handle_message(message: Message):
         )
         return
 
+    # Блокируем новые сообщения для этого юзера, пока не закончится стрим
     async with lock:
         await bot.send_chat_action(message.chat.id, "typing")
         history = user_histories[uid]
