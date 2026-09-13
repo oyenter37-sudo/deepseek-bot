@@ -8,9 +8,9 @@ from collections import defaultdict
 
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.utils.markdown import bold
 
 # ================= КОНФИГУРАЦИЯ =================
 TELEGRAM_TOKEN = "8849412275:AAGoCjOMVFg0W74FUGcgAsDwT2w_lbiAk40"
@@ -33,7 +33,7 @@ SYSTEM_PROMPT = (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="Markdown")
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
 client = AsyncOpenAI(
@@ -66,7 +66,7 @@ def save_data():
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "stats": {str(k): v for k, v in user_stats.items()},
-                "times": processing_times[-1000:],  # Храним последние 1000 записей
+                "times": processing_times[-1000:],
             }, f)
     except Exception as e:
         logger.error(f"Failed to save data: {e}")
@@ -142,10 +142,6 @@ async def cb_clear_history(callback: CallbackQuery):
 
 # ================= ПАРСИНГ ФАЙЛОВ ИЗ ОТВЕТА =================
 def extract_files(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Извлекает файлы из текста по тегам [FILE:name]...[/FILE].
-    Возвращает (очищенный текст, список (имя, содержимое)).
-    """
     files = []
     clean_parts = []
     remaining = text
