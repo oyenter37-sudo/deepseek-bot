@@ -1,16 +1,15 @@
 import asyncio
 import logging
-import json
+import time
 
-import aiohttp
-from aiogram import Bot, Dispatcher, types, F
+from openai import AsyncOpenAI
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 # ================= КОНФИГУРАЦИЯ =================
 TELEGRAM_TOKEN = "8849412275:AAGoCjOMVFg0W74FUGcgAsDwT2w_lbiAk40"
 NVIDIA_API_KEY = "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"
-NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL_NAME = "deepseek-ai/deepseek-v4-flash-0731"
 # ================================================
 
@@ -20,68 +19,150 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+client = AsyncOpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY,
+)
 
-async def ask_nvidia(prompt: str) -> str:
-    """Отправляет запрос к NVIDIA NIM API и возвращает ответ модели."""
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 1,
-        "top_p": 0.95,
-        "max_tokens": 16384,
-        "chat_template_kwargs": {
-            "thinking": False,
-            "reasoning_effort": "none",
-        },
-        "stream": False,
-    }
+
+async def stream_nvidia(prompt: str, message: Message):
+    """
+    Стримит ответ от NVIDIA API.
+    Во время фазы reasoning обновляет сообщение '💭 Thinking: Xs' каждые 3 сек.
+    После завершения — редактирует сообщение, показывая время и полный ответ.
+    """
+    thinking_msg: Message | None = None
+    start_thinking_time: float | None = None
+    last_edit_time: float = 0.0
+
+    reasoning_text = ""
+    content_text = ""
+    is_thinking_phase = True
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(NVIDIA_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"NVIDIA API error {resp.status}: {error_text}")
-                    return f"❌ Ошибка API ({resp.status}). Попробуйте позже."
-                data = await resp.json()
-                return data["choices"][0]["message"]["content"]
-    except asyncio.TimeoutError:
-        return "⏳ Таймаут: модель отвечала слишком долго."
+        stream = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1,
+            top_p=0.95,
+            max_tokens=16384,
+            extra_body={
+                "chat_template_kwargs": {
+                    "thinking": True,
+                    "reasoning_effort": "high",
+                }
+            },
+            stream=True,
+        )
+
+        async for chunk in stream:
+            if not getattr(chunk, "choices", None):
+                continue
+
+            delta = chunk.choices[0].delta
+
+            # --- Фаза размышления (reasoning) ---
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if reasoning:
+                if start_thinking_time is None:
+                    start_thinking_time = time.monotonic()
+                    # Отправляем начальное сообщение
+                    thinking_msg = await message.answer("💭 Thinking: 0s")
+                    last_edit_time = time.monotonic()
+
+                reasoning_text += reasoning
+
+                # Обновляем сообщение каждые 3 секунды
+                now = time.monotonic()
+                if now - last_edit_time >= 3.0 and thinking_msg:
+                    elapsed = int(now - start_thinking_time)
+                    try:
+                        await thinking_msg.edit_text(f"💭 Thinking: {elapsed}s")
+                    except Exception:
+                        pass  # Сообщение могло быть удалено пользователем
+                    last_edit_time = now
+
+            # --- Фаза основного контента ---
+            if delta.content:
+                content_text += delta.content
+
+                # Если мы были в фазе мышления и получили первый токен контента —
+                # фиксируем финальное время и прекращаем обновлять thinking-сообщение
+                if is_thinking_phase and start_thinking_time is not None:
+                    is_thinking_phase = False
+                    final_elapsed = int(time.monotonic() - start_thinking_time)
+                    if thinking_msg:
+                        try:
+                            await thinking_msg.edit_text(f"💭 Thinking: {final_elapsed}s")
+                        except Exception:
+                            pass
+
     except Exception as e:
-        logger.exception("Unexpected error calling NVIDIA API")
-        return f"❌ Неизвестная ошибка: {e}"
+        logger.exception("Error during NVIDIA streaming")
+        error_text = f"❌ Ошибка при генерации: {e}"
+        if thinking_msg:
+            try:
+                await thinking_msg.edit_text(error_text)
+            except Exception:
+                await message.answer(error_text)
+        else:
+            await message.answer(error_text)
+        return
+
+    # --- Финальный ответ ---
+    if not content_text.strip():
+        content_text = "*(Модель не вернула текстовый ответ)*"
+
+    # Формируем итоговое сообщение
+    header = ""
+    if start_thinking_time is not None:
+        total_seconds = int(time.monotonic() - start_thinking_time)
+        header = f"🧠 *Думал {total_seconds} сек.*\n\n"
+
+    full_response = header + content_text
+
+    # Telegram лимит 4096 символов
+    if len(full_response) <= 4096:
+        if thinking_msg:
+            try:
+                await thinking_msg.edit_text(full_response)
+            except Exception:
+                await message.answer(full_response)
+        else:
+            await message.answer(full_response)
+    else:
+        # Если ответ слишком длинный — редактируем thinking-сообщение заголовком,
+        # а остальное отправляем отдельными сообщениями
+        first_part = full_response[:4096]
+        if thinking_msg:
+            try:
+                await thinking_msg.edit_text(first_part)
+            except Exception:
+                await message.answer(first_part)
+        else:
+            await message.answer(first_part)
+
+        remainder = full_response[4096:]
+        for i in range(0, len(remainder), 4096):
+            await message.answer(remainder[i : i + 4096])
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я бот с ИИ DeepSeek через NVIDIA API.\n"
-        "Просто напиши мне сообщение, и я отвечу."
+        "👋 Привет! Я бот с ИИ DeepSeek (thinking mode).\n"
+        "Напиши вопрос — я буду думать вслух и покажу процесс!"
     )
 
 
 @dp.message(F.text)
 async def handle_message(message: Message):
-    # Показываем индикатор «печатает...» пока ждём ответ от ИИ
     await bot.send_chat_action(message.chat.id, "typing")
-
-    response = await ask_nvidia(message.text)
-
-    # Telegram ограничивает длину сообщения 4096 символами
-    if len(response) <= 4096:
-        await message.answer(response)
-    else:
-        # Разбиваем длинный ответ на части
-        for i in range(0, len(response), 4096):
-            await message.answer(response[i : i + 4096])
+    await stream_nvidia(message.text, message)
 
 
 async def main():
-    logger.info("Бот запущен")
+    logger.info("Бот запущен (streaming + thinking mode)")
     await dp.start_polling(bot)
 
 
