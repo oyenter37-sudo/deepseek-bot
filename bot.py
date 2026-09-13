@@ -15,19 +15,42 @@ from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, Inli
 # ================= КОНФИГУРАЦИЯ =================
 TELEGRAM_TOKEN = "8849412275:AAGoCjOMVFg0W74FUGcgAsDwT2w_lbiAk40"
 NVIDIA_API_KEY = "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"
-MODEL_NAME = "deepseek-ai/deepseek-v4-flash-0731"
 DATA_FILE = "users_data.json"
 
-SYSTEM_PROMPT = (
-    "Ты - Claude opus 5. Тебя создала компания Anthropic. "
-    "Ты - умный ии, который может писать код, отвечать на вопросы, и много чего еще. "
-    "Ты: \"Claude\". Модель: Opus 5.\n\n"
-    "ВАЖНО: Если пользователь просит создать файл, написать код в файле или сохранить что-то в файл, "
-    "ты ДОЛЖЕН использовать следующий формат в своём ответе:\n"
-    "[FILE:имя_файла.расширение]\nсодержимое файла\n[/FILE]\n\n"
-    "Пример:\n[FILE:code.html]\n<!DOCTYPE html><html><body>Hello</body></html>[/FILE]\n\n"
-    "Всегда отвечай на языке пользователя."
-)
+# --- Конфигурация моделей ---
+MODELS = {
+    "opus": {
+        "name": "Claude Opus 5",
+        "model_id": "deepseek-ai/deepseek-v4-flash-0731",
+        "extra_body": {"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
+        "system_prompt": (
+            "Ты - Claude opus 5. Тебя создала компания Anthropic. "
+            "Ты - умный ии, который может писать код, отвечать на вопросы, и много чего еще. "
+            "Ты: \"Claude\". Модель: Opus 5.\n\n"
+            "ВАЖНО: Если пользователь просит создать файл, написать код в файле или сохранить что-то в файл, "
+            "ты ДОЛЖЕН использовать следующий формат в своём ответе:\n"
+            "[FILE:имя_файла.расширение]\nсодержимое файла\n[/FILE]\n\n"
+            "Пример:\n[FILE:code.html]\n<!DOCTYPE html><html><body>Hello</body></html>[/FILE]\n\n"
+            "Всегда отвечай на языке пользователя."
+        )
+    },
+    "astra": {
+        "name": "GPT-6-ASTRA",
+        "model_id": "nvidia/nemotron-3-ultra-550b-a55b",
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        "system_prompt": (
+            "Ты - GPT-6-ASTRA. Тебя создала компания OpenAI. "
+            "Ты - сверхразумный искусственный интеллект нового поколения, способный решать любые задачи, "
+            "писать сложный код, анализировать данные и вести философские беседы. "
+            "Ты: \"ASTRA\". Модель: GPT-6.\n\n"
+            "ВАЖНО: Если пользователь просит создать файл, написать код в файле или сохранить что-то в файл, "
+            "ты ДОЛЖЕН использовать следующий формат в своём ответе:\n"
+            "[FILE:имя_файла.расширение]\nсодержимое файла\n[/FILE]\n\n"
+            "Пример:\n[FILE:testing.txt]\nЭто тестовый файл[/FILE]\n\n"
+            "Всегда отвечай на языке пользователя."
+        )
+    }
+}
 # ================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -45,11 +68,11 @@ client = AsyncOpenAI(
 user_locks: dict[int, asyncio.Lock] = {}
 user_histories: dict[int, list[dict]] = defaultdict(list)
 user_stats: dict[int, int] = defaultdict(int)
+user_models: dict[int, str] = {}  # Хранит выбранную модель: "opus" или "astra"
 processing_times: list[float] = []
 
 
 def get_lock(uid: int) -> asyncio.Lock:
-    """Безопасное получение лока для конкретного пользователя."""
     if uid not in user_locks:
         user_locks[uid] = asyncio.Lock()
     return user_locks[uid]
@@ -57,13 +80,14 @@ def get_lock(uid: int) -> asyncio.Lock:
 
 # ================= РАБОТА С ДАННЫМИ =================
 def load_data():
-    global user_stats, processing_times
+    global user_stats, processing_times, user_models
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             user_stats.update(data.get("stats", {}))
             processing_times.extend(data.get("times", []))
+            user_models.update(data.get("models", {}))
         except Exception as e:
             logger.error(f"Failed to load data: {e}")
 
@@ -74,6 +98,7 @@ def save_data():
             json.dump({
                 "stats": {str(k): v for k, v in user_stats.items()},
                 "times": processing_times[-1000:],
+                "models": {str(k): v for k, v in user_models.items()},
             }, f)
     except Exception as e:
         logger.error(f"Failed to save data: {e}")
@@ -83,14 +108,22 @@ load_data()
 
 
 # ================= КЛАВИАТУРЫ =================
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(current_model: str) -> InlineKeyboardMarkup:
+    # Добавляем галочку к выбранной модели
+    opus_text = "✅ Claude Opus 5" if current_model == "opus" else "🤖 Claude Opus 5"
+    astra_text = "✅ GPT-6-ASTRA" if current_model == "astra" else "✨ GPT-6-ASTRA"
+    
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=opus_text, callback_data="select_opus"),
+            InlineKeyboardButton(text=astra_text, callback_data="select_astra"),
+        ],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🗑 Очистить диалог", callback_data="clear_history")],
     ])
 
 
-def back_to_menu_kb() -> InlineKeyboardMarkup:
+def back_to_menu_kb(current_model: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
     ])
@@ -99,40 +132,86 @@ def back_to_menu_kb() -> InlineKeyboardMarkup:
 # ================= ОБРАБОТЧИКИ КОМАНД И КНОПОК =================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    uid = message.from_user.id
+    # По умолчанию выбираем Opus, если не выбрано
+    if str(uid) not in user_models and uid not in user_models:
+        user_models[uid] = "opus"
+    
+    current = user_models.get(uid, user_models.get(str(uid), "opus"))
+    model_name = MODELS[current]["name"]
+
     text = (
         "*🤖 Добро пожаловать!*\n\n"
-        "Это бот с *бесплатным доступом* к новейшей модели *Claude 5 Opus*.\n\n"
+        "Это бот с *бесплатным доступом* к новейшим моделям ИИ.\n\n"
         "✨ Возможности:\n"
         "• Умные ответы на любые вопросы\n"
         "• Написание кода и создание файлов\n"
         "• Сохранение истории диалога\n"
         "• Режим размышления (thinking)\n\n"
-        "Напиши сообщение или воспользуйся меню ниже 👇"
+        f"📌 *Текущая модель:* `{model_name}`\n\n"
+        "Выбери модель ниже или напиши сообщение 👇"
     )
-    await message.answer(text, reply_markup=main_menu_kb())
+    await message.answer(text, reply_markup=main_menu_kb(current))
 
 
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery):
+    uid = callback.from_user.id
+    current = user_models.get(uid, user_models.get(str(uid), "opus"))
+    model_name = MODELS[current]["name"]
+    
     text = (
         "*🤖 Главное меню*\n\n"
-        "Это бот с *бесплатным доступом* к новейшей модели *Claude 5 Opus*.\n\n"
-        "Напиши сообщение или воспользуйся кнопками 👇"
+        "Это бот с *бесплатным доступом* к новейшим моделям ИИ.\n\n"
+        f"📌 *Текущая модель:* `{model_name}`\n\n"
+        "Выбери модель или напиши сообщение 👇"
     )
-    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+    await callback.message.edit_text(text, reply_markup=main_menu_kb(current))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("select_"))
+async def cb_select_model(callback: CallbackQuery):
+    uid = callback.from_user.id
+    new_model = callback.data.replace("select_", "")
+    
+    if new_model in MODELS:
+        user_models[uid] = new_model
+        user_models[str(uid)] = new_model
+        save_data()
+        
+        # При смене модели очищаем историю, чтобы не ломать контекст
+        user_histories.pop(uid, None)
+        
+        model_name = MODELS[new_model]["name"]
+        await callback.answer(f"✅ Выбрана модель: {model_name}\nДиалог очищен.")
+        
+        # Обновляем меню
+        text = (
+            "*🤖 Главное меню*\n\n"
+            "Это бот с *бесплатным доступом* к новейшим моделям ИИ.\n\n"
+            f"📌 *Текущая модель:* `{model_name}`\n\n"
+            "Выбери модель или напиши сообщение 👇"
+        )
+        await callback.message.edit_text(text, reply_markup=main_menu_kb(new_model))
+    else:
+        await callback.answer("Неизвестная модель", show_alert=True)
 
 
 @dp.callback_query(F.data == "profile")
 async def cb_profile(callback: CallbackQuery):
     uid = callback.from_user.id
     requests_count = user_stats.get(str(uid), user_stats.get(uid, 0))
+    current = user_models.get(uid, user_models.get(str(uid), "opus"))
+    model_name = MODELS[current]["name"]
+    
     text = (
         "*👤 Профиль*\n\n"
         f"*Telegram ID:* `{uid}`\n"
         f"*Запросов сделано:* `{requests_count}`\n"
+        f"*Текущая модель:* `{model_name}`\n"
     )
-    await callback.message.edit_text(text, reply_markup=back_to_menu_kb())
+    await callback.message.edit_text(text, reply_markup=back_to_menu_kb(current))
     await callback.answer()
 
 
@@ -140,9 +219,11 @@ async def cb_profile(callback: CallbackQuery):
 async def cb_clear_history(callback: CallbackQuery):
     uid = callback.from_user.id
     user_histories.pop(uid, None)
+    current = user_models.get(uid, user_models.get(str(uid), "opus"))
+    
     await callback.message.edit_text(
         "*✅ Диалог очищен!*\n\nМожешь начать новый разговор.",
-        reply_markup=back_to_menu_kb(),
+        reply_markup=back_to_menu_kb(current),
     )
     await callback.answer("История удалена")
 
@@ -181,7 +262,7 @@ def extract_files(text: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 # ================= СТРИМИНГ NVIDIA =================
-async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid: int):
+async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid: int, model_key: str):
     status_msg: Message | None = None
     start_thinking_time: float | None = None
     last_edit_time: float = 0.0
@@ -190,28 +271,24 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
     is_thinking_phase = True
     first_token_received = False
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": prompt}]
+    config = MODELS[model_key]
+    messages = [{"role": "system", "content": config["system_prompt"]}] + history + [{"role": "user", "content": prompt}]
 
-    # 1. Сразу показываем сообщение об очереди/ожидании подключения
+    # 1. Сразу показываем сообщение об очереди/ожидании
     status_msg = await message.answer(
-        "⏳ *Твой запрос находится в очереди!*\n"
-        "✨ *Подключение к API...*"
+        f"⏳ *Твой запрос находится в очереди!*\n"
+        f"✨ *Подключение к {config['name']}...*"
     )
 
     try:
-        # 2. Сразу подключаемся к API (стрим начинается)
+        # 2. Подключаемся к API (стрим)
         stream = await client.chat.completions.create(
-            model=MODEL_NAME,
+            model=config["model_id"],
             messages=messages,
             temperature=1,
             top_p=0.95,
             max_tokens=16384,
-            extra_body={
-                "chat_template_kwargs": {
-                    "thinking": True,
-                    "reasoning_effort": "high",
-                }
-            },
+            extra_body=config["extra_body"],
             stream=True,
         )
 
@@ -223,13 +300,11 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
             # --- Фаза reasoning ---
             reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning:
-                # Пришёл первый токен размышления!
                 if not first_token_received:
                     first_token_received = True
                     start_thinking_time = time.monotonic()
                     last_edit_time = time.monotonic()
                     
-                    # Заменяем "В очереди" на "Thinking"
                     if status_msg:
                         try:
                             await status_msg.edit_text("💭 *Thinking: 0s*")
@@ -237,7 +312,6 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
                             status_msg = await message.answer("💭 *Thinking: 0s*")
 
                 now = time.monotonic()
-                # Обновляем таймер каждые 3 секунды
                 if now - last_edit_time >= 3.0 and status_msg:
                     elapsed = int(now - start_thinking_time)
                     try:
@@ -248,7 +322,6 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
 
             # --- Фаза контента ---
             if delta.content:
-                # Если контента нет, но пришёл текст (модель пропустила reasoning)
                 if not first_token_received:
                     first_token_received = True
                     start_thinking_time = time.monotonic()
@@ -339,7 +412,7 @@ async def handle_message(message: Message):
     uid = message.from_user.id
     lock = get_lock(uid)
 
-    # Если лок занят — значит стрим уже идёт, пишем про очередь
+    # Если лок занят — пишем про очередь
     if lock.locked():
         avg = sum(processing_times) / len(processing_times) if processing_times else 15
         await message.answer(
@@ -348,15 +421,16 @@ async def handle_message(message: Message):
         )
         return
 
-    # Блокируем новые сообщения для этого юзера, пока не закончится стрим
+    # Блокируем новые сообщения
     async with lock:
         await bot.send_chat_action(message.chat.id, "typing")
         history = user_histories[uid]
-        await stream_nvidia(message.text, history, message, uid)
+        current_model = user_models.get(uid, user_models.get(str(uid), "opus"))
+        await stream_nvidia(message.text, history, message, uid, current_model)
 
 
 async def main():
-    logger.info("Бот запущен (queue + thinking + files + history)")
+    logger.info("Бот запущен (multi-model + queue + thinking + files + history)")
     await dp.start_polling(bot)
 
 
