@@ -17,7 +17,9 @@ TELEGRAM_TOKEN = "8849412275:AAGoCjOMVFg0W74FUGcgAsDwT2w_lbiAk40"
 NVIDIA_API_KEY = "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"
 DATA_FILE = "users_data.json"
 
-# --- Конфигурация моделей ---
+MAX_RETRIES = 8       # Максимальное количество попыток переподключения
+TIMEOUT_SECONDS = 5.0 # Время ожидания первых токенов
+
 MODELS = {
     "opus": {
         "name": "Claude Opus 5",
@@ -68,7 +70,7 @@ client = AsyncOpenAI(
 user_locks: dict[int, asyncio.Lock] = {}
 user_histories: dict[int, list[dict]] = defaultdict(list)
 user_stats: dict[int, int] = defaultdict(int)
-user_models: dict[int, str] = {}  # Хранит выбранную модель: "opus" или "astra"
+user_models: dict[int, str] = {}
 processing_times: list[float] = []
 
 
@@ -109,7 +111,6 @@ load_data()
 
 # ================= КЛАВИАТУРЫ =================
 def main_menu_kb(current_model: str) -> InlineKeyboardMarkup:
-    # Добавляем галочку к выбранной модели
     opus_text = "✅ Claude Opus 5" if current_model == "opus" else "🤖 Claude Opus 5"
     astra_text = "✅ GPT-6-ASTRA" if current_model == "astra" else "✨ GPT-6-ASTRA"
     
@@ -133,7 +134,6 @@ def back_to_menu_kb(current_model: str) -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     uid = message.from_user.id
-    # По умолчанию выбираем Opus, если не выбрано
     if str(uid) not in user_models and uid not in user_models:
         user_models[uid] = "opus"
     
@@ -179,14 +179,11 @@ async def cb_select_model(callback: CallbackQuery):
         user_models[uid] = new_model
         user_models[str(uid)] = new_model
         save_data()
-        
-        # При смене модели очищаем историю, чтобы не ломать контекст
         user_histories.pop(uid, None)
         
         model_name = MODELS[new_model]["name"]
         await callback.answer(f"✅ Выбрана модель: {model_name}\nДиалог очищен.")
         
-        # Обновляем меню
         text = (
             "*🤖 Главное меню*\n\n"
             "Это бот с *бесплатным доступом* к новейшим моделям ИИ.\n\n"
@@ -261,7 +258,7 @@ def extract_files(text: str) -> tuple[str, list[tuple[str, str]]]:
     return clean_text, files
 
 
-# ================= СТРИМИНГ NVIDIA =================
+# ================= СТРИМИНГ NVIDIA С РЕТРАЯМИ =================
 async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid: int, model_key: str):
     status_msg: Message | None = None
     start_thinking_time: float | None = None
@@ -274,87 +271,177 @@ async def stream_nvidia(prompt: str, history: list[dict], message: Message, uid:
     config = MODELS[model_key]
     messages = [{"role": "system", "content": config["system_prompt"]}] + history + [{"role": "user", "content": prompt}]
 
-    # 1. Сразу показываем сообщение об очереди/ожидании
+    # 1. Сразу показываем сообщение об очереди
     status_msg = await message.answer(
         f"⏳ *Твой запрос находится в очереди!*\n"
-        f"✨ *Подключение к {config['name']}...*"
+        f"✨ *Попытка 1/{MAX_RETRIES}...*"
     )
 
-    try:
-        # 2. Подключаемся к API (стрим)
-        stream = await client.chat.completions.create(
-            model=config["model_id"],
-            messages=messages,
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-            extra_body=config["extra_body"],
-            stream=True,
-        )
+    attempt = 0
+    
+    while True:
+        attempt += 1
+        first_token_received = False
+        
+        # Флаг для остановки цикла чтения, если таймаут сработал
+        stop_reading = asyncio.Event()
 
-        async for chunk in stream:
-            if not getattr(chunk, "choices", None):
-                continue
-            delta = chunk.choices[0].delta
+        try:
+            # 2. Подключаемся к API
+            stream = await client.chat.completions.create(
+                model=config["model_id"],
+                messages=messages,
+                temperature=1,
+                top_p=0.95,
+                max_tokens=16384,
+                extra_body=config["extra_body"],
+                stream=True,
+            )
 
-            # --- Фаза reasoning ---
-            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-            if reasoning:
-                if not first_token_received:
-                    first_token_received = True
-                    start_thinking_time = time.monotonic()
-                    last_edit_time = time.monotonic()
+            # 3. Запускаем чтение стрима как задачу (task)
+            async def read_stream():
+                nonlocal first_token_received, start_thinking_time, last_edit_time
+                nonlocal content_text, is_thinking_phase, status_msg
+
+                async for chunk in stream:
+                    # Если сработал таймаут — прерываем чтение этого стрима
+                    if stop_reading.is_set():
+                        break
+
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    # --- Фаза reasoning ---
+                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if reasoning:
+                        first_token_received = True
+                        if start_thinking_time is None:
+                            start_thinking_time = time.monotonic()
+                            last_edit_time = time.monotonic()
+                            
+                            if status_msg:
+                                try:
+                                    await status_msg.edit_text("💭 *Thinking: 0s*")
+                                except Exception:
+                                    status_msg = await message.answer("💭 *Thinking: 0s*")
+
+                        now = time.monotonic()
+                        if now - last_edit_time >= 3.0 and status_msg:
+                            elapsed = int(now - start_thinking_time)
+                            try:
+                                await status_msg.edit_text(f"💭 *Thinking: {elapsed}s*")
+                            except Exception:
+                                pass
+                            last_edit_time = now
+
+                    # --- Фаза контента ---
+                    if delta.content:
+                        first_token_received = True
+                        if start_thinking_time is None:
+                            start_thinking_time = time.monotonic()
+                            if status_msg:
+                                try:
+                                    await status_msg.delete()
+                                except Exception:
+                                    pass
+                                status_msg = None
+
+                        content_text += delta.content
+                        
+                        if is_thinking_phase and start_thinking_time is not None:
+                            is_thinking_phase = False
+                            final_elapsed = int(time.monotonic() - start_thinking_time)
+                            if status_msg:
+                                try:
+                                    await status_msg.edit_text(f"💭 *Thinking: {final_elapsed}s*")
+                                except Exception:
+                                    pass
+
+            read_task = asyncio.create_task(read_stream())
+
+            # 4. Ждём 5 секунд появления первого токена
+            wait_time = TIMEOUT_SECONDS
+            while wait_time > 0 and not first_token_received and not read_task.done():
+                await asyncio.sleep(0.5)
+                wait_time -= 0.5
+
+            # 5. Проверяем результат ожидания
+            if not first_token_received and not read_task.done():
+                # Токены не пришли за 5 секунд!
+                
+                if attempt < MAX_RETRIES:
+                    # Прерываем текущий стрим
+                    stop_reading.set()
+                    read_task.cancel()
+                    try:
+                        await read_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     
+                    # Обновляем сообщение о новой попытке
                     if status_msg:
                         try:
-                            await status_msg.edit_text("💭 *Thinking: 0s*")
+                            await status_msg.edit_text(
+                                f"⏳ *Твой запрос находится в очереди!*\n"
+                                f"⚠️ *Нет ответа. Переподключение...*\n"
+                                f"✨ *Попытка {attempt + 1}/{MAX_RETRIES}...*"
+                            )
                         except Exception:
-                            status_msg = await message.answer("💭 *Thinking: 0s*")
+                            pass
+                    
+                    # Небольшая пауза перед новым запросом
+                    await asyncio.sleep(1)
+                    continue  # Переходим к следующей итерации while True (новый запрос)
+                
+                else:
+                    # Достигли 8 попыток. Просто ждём бесконечно.
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text(
+                                f"⏳ *Твой запрос находится в очереди!*\n"
+                                f"⚠️ *Лимит попыток исчерпан.*\n"
+                                f"✨ *Ожидаем ответ от сервера...*"
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Ждём завершения задачи без таймаутов
+                    await read_task
+                    break
+            else:
+                # Токены пришли вовремя! Просто ждём завершения стрима
+                await read_task
+                break
 
-                now = time.monotonic()
-                if now - last_edit_time >= 3.0 and status_msg:
-                    elapsed = int(now - start_thinking_time)
+        except Exception as e:
+            # Ошибка сети/API при создании стрима
+            if attempt < MAX_RETRIES:
+                if status_msg:
                     try:
-                        await status_msg.edit_text(f"💭 *Thinking: {elapsed}s*")
+                        await status_msg.edit_text(
+                            f"⏳ *Твой запрос находится в очереди!*\n"
+                            f"❌ *Ошибка: {type(e).__name__}*\n"
+                            f"✨ *Попытка {attempt + 1}/{MAX_RETRIES}...*"
+                        )
                     except Exception:
                         pass
-                    last_edit_time = now
+                await asyncio.sleep(1)
+                continue
+            else:
+                logger.exception("Streaming error after max retries")
+                err = f"*❌ Ошибка генерации после {MAX_RETRIES} попыток:* `{e}`"
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(err)
+                    except Exception:
+                        await message.answer(err)
+                else:
+                    await message.answer(err)
+                return
 
-            # --- Фаза контента ---
-            if delta.content:
-                if not first_token_received:
-                    first_token_received = True
-                    start_thinking_time = time.monotonic()
-                    if status_msg:
-                        try:
-                            await status_msg.delete()
-                        except Exception:
-                            pass
-                        status_msg = None
-
-                content_text += delta.content
-                
-                if is_thinking_phase and start_thinking_time is not None:
-                    is_thinking_phase = False
-                    final_elapsed = int(time.monotonic() - start_thinking_time)
-                    if status_msg:
-                        try:
-                            await status_msg.edit_text(f"💭 *Thinking: {final_elapsed}s*")
-                        except Exception:
-                            pass
-
-    except Exception as e:
-        logger.exception("Streaming error")
-        err = f"*❌ Ошибка генерации:* `{e}`"
-        if status_msg:
-            try:
-                await status_msg.edit_text(err)
-            except Exception:
-                await message.answer(err)
-        else:
-            await message.answer(err)
-        return
-
+    # === Обработка завершена успешно ===
+    
     # Записываем время обработки
     if start_thinking_time:
         processing_times.append(time.monotonic() - start_thinking_time)
@@ -412,7 +499,6 @@ async def handle_message(message: Message):
     uid = message.from_user.id
     lock = get_lock(uid)
 
-    # Если лок занят — пишем про очередь
     if lock.locked():
         avg = sum(processing_times) / len(processing_times) if processing_times else 15
         await message.answer(
@@ -421,7 +507,6 @@ async def handle_message(message: Message):
         )
         return
 
-    # Блокируем новые сообщения
     async with lock:
         await bot.send_chat_action(message.chat.id, "typing")
         history = user_histories[uid]
@@ -430,7 +515,7 @@ async def handle_message(message: Message):
 
 
 async def main():
-    logger.info("Бот запущен (multi-model + queue + thinking + files + history)")
+    logger.info("Бот запущен (retries + queue + thinking + files + history)")
     await dp.start_polling(bot)
 
 
